@@ -221,6 +221,34 @@ def ensure_splits(adapter, run_dir: RunDir, *, seed: int = 0, ratios=(0.5, 0.25,
     return splits
 
 
+def refuse_degenerate_split(splits: Splits, run_dir: RunDir, *, step: str = "baseline") -> bool:
+    """Refuse a ratio split with no val or no test; warn on a tiny val (#113).
+
+    A val-gated run with zero val tasks has nothing to decide on, and a sealed-test
+    run with zero test tasks produces its headline number over nothing — both fail
+    silently today because ``make_splits`` clamps sizes without a floor
+    (``splits.py:113-119``). Failing here costs nothing; failing at finalize costs the
+    whole run. A pinned ``--split-ids`` may be deliberately degenerate (the no-holdout
+    case), so only the ratio path is guarded — by the caller. Shared by the two phases
+    that may freeze the split (baseline, and the dry run when it runs first).
+    """
+    if not splits.val or not splits.test:
+        msg = (f"degenerate ratio split: train={len(splits.train)} val={len(splits.val)} "
+               f"test={len(splits.test)} — the val gate and the sealed test number both "
+               "need at least one task. Add tasks, change --ratios, or pin --split-ids "
+               "deliberately.")
+        run_dir.log_event("splits_warning", msg=msg)
+        print(json.dumps({"step": step, "error": msg}, indent=2), file=sys.stderr)
+        return True
+    if len(splits.val) < 5:
+        run_dir.log_event(
+            "splits_warning",
+            msg=(f"val has only {len(splits.val)} task(s) — the gate's Δ > k·SE bar is "
+                 "optimistic at this n, and a one-task improvement cannot reliably clear "
+                 "it at all (#351). Prefer >= 5 val tasks."))
+    return False
+
+
 def _seed_pass_rates(run_dir: RunDir) -> dict:
     """Per-task pass rate of the seed from a prior ``baseline.json`` ({} when there is none)."""
     try:
@@ -4673,9 +4701,14 @@ def _focus_instructions(current_val: SplitResult, focus_ids, label: str,
                         instructions_file=None, bench_repo: str | None = None,
                         optimizer_name: str | None = None,
                         seed_empty: bool | None = None,
-                        target_reader: str = "") -> str:
+                        target_reader: str = "",
+                        dry_run_findings: str = "") -> str:
     """Render one iteration's INSTRUCTIONS by substituting dynamic blocks into the
     optimizer-instructions template.
+
+    ``dry_run_findings`` is the dry run's as-is findings block (``dryrun.hints_block``). It fills
+    ``{{DRY_RUN_FINDINGS}}``; a template that predates that placeholder gets the block appended
+    instead, and with no dry run it is empty either way.
 
     The static framing (analyze → ideate → edit, the read-pointers, the code-bearing
     tools guidance, the economy footer) lives in the template file — authored by the
@@ -4723,6 +4756,7 @@ def _focus_instructions(current_val: SplitResult, focus_ids, label: str,
         "{{PARALLEL_NOTE}}": parallel_note,
         "{{EMPTY_SEED}}": empty_note,
         "{{TARGET_READER}}": target_reader,
+        "{{DRY_RUN_FINDINGS}}": dry_run_findings,
     }
 
     tmpl_path = Path(instructions_file) if instructions_file else _DEFAULT_INSTRUCTIONS_TEMPLATE
@@ -4735,6 +4769,8 @@ def _focus_instructions(current_val: SplitResult, focus_ids, label: str,
     except OSError as e:
         why = f"could not be read ({e})"
     if tmpl and "{{FOCUS_SUMMARY}}" in tmpl:
+        if dry_run_findings and "{{DRY_RUN_FINDINGS}}" not in tmpl:
+            tmpl = tmpl.rstrip() + "\n\n{{DRY_RUN_FINDINGS}}\n"
         for k, v in repl.items():
             tmpl = tmpl.replace(k, v)
         return tmpl
@@ -4764,7 +4800,7 @@ def _focus_instructions(current_val: SplitResult, focus_ids, label: str,
            "./prior_iterations/; fill ./PROCESS.md and APPEND your entry to ./JOURNAL.md. "
            if history_enabled() else "; fill ./PROCESS.md. ")
         + "The prompt and the tools are equally fair game.",
-        bench, "", failures, passing, cap, "", algo, "",
+        bench, "", failures, passing, cap, "", algo, "", dry_run_findings,
         "Address EVERY failure cluster you found, not just the biggest. The DEFAULT fix "
         "for a violated rule/precondition/formula is to move it INTO THE CODE BODY of the "
         "EXISTING tool it governs — an in-body validation/normalization that raises an "
@@ -4821,6 +4857,7 @@ class OptimizerContext:
     bench_repo: str | None = None
     target_reader: str = ""
     memory_skill: str = "md-files"
+    dry_run_findings: str = ""
 
     # ---- construction from an algorithm run.py --------------------------------
 
@@ -4886,6 +4923,7 @@ class OptimizerContext:
             bench_repo=getattr(args, "bench_repo", None),
             target_reader=_tp.reader_block(profile),
             memory_skill=getattr(args, "memory_skill", None) or "md-files",
+            dry_run_findings=_dry_run_hints(run_dir),
         )
 
     @classmethod
@@ -4977,6 +5015,7 @@ class OptimizerContext:
                 if self.bench_repo else ""),
             "{{PARALLEL_NOTE}}": _parallel_note(_optimizer_parallel(self.optimizer_name),
                                                 self.optimizer_name),
+            "{{DRY_RUN_FINDINGS}}": self.dry_run_findings,
             # Per-iteration, deliberately blank — see the docstring.
             "{{FOCUS_SUMMARY}}": "",
             "{{FAILURES}}": "",
@@ -5025,8 +5064,18 @@ class OptimizerContext:
             current_val, focus_ids, label, capabilities=list(self.capabilities),
             algorithm=algorithm, instructions_file=self.instructions_file,
             bench_repo=self.bench_repo, optimizer_name=self.optimizer_name,
-            seed_empty=seed_empty, target_reader=self.target_reader)
+            seed_empty=seed_empty, target_reader=self.target_reader,
+            dry_run_findings=self.dry_run_findings)
         return (text.rstrip() + "\n\n" + extra.strip() + "\n") if extra.strip() else text
+
+
+def _dry_run_hints(run_dir) -> str:
+    """The dry run's as-is findings as an optimizer block ("" when the phase did not run)."""
+    try:
+        from . import dryrun
+        return dryrun.hints_for_run(run_dir)
+    except Exception:  # noqa: BLE001 — a hint must never break an iteration
+        return ""
 
 
 def parse_protected_paths(value) -> tuple[str, ...] | None:

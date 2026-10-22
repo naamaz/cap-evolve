@@ -191,6 +191,31 @@ path, how to obtain it, and the alternatives. Never invent a NEEDED input.
 - **orchestration_mode** (default `deterministic`): `deterministic` = cap-evolve sequences the loop (code-enforced honesty). `agent` = the coding agent drives the loop via cap-evolve primitives and seals with the finalize phase script (`skills/phases/finalize/scripts/run.py`). Agent mode also uses `stop_condition`.
 - **stop_condition** (default empty): agent-mode free-text halt rule, re-read each round. Deterministic mode ignores it and uses the budget knobs.
 
+- **dry_run** (default `false`; ask in the numbered batch): run the `dry-run` phase between
+  `implement-and-check` and `baseline` — the coding agent reads the whole system (capability,
+  agent/runner code, orchestration, scorer) for major flow flaws and obvious bugs before any
+  eval budget is spent. Fixes inside the editable capability apply automatically (to a copy
+  of the seed); every other fix needs the user's approval. Cost: one agent reading pass
+  (optimizer spend) plus whatever `dry_run_verify` adds. Default `false` keeps existing runs
+  unchanged — log it in `PROJECT.md` as "no pre-baseline inspection; flow flaws are left for
+  the loop to discover from traces".
+- **dry_run_verify** (default `targeted`; ask only when `dry_run: true`): how the fixes are
+  checked. State the eval cost of each option in the question:
+  - `targeted` — a smoke check: up to `dry_run_verify_cases_per_fix` (3) train cases per fix,
+    at most `dry_run_verify_max_cases` (12), plus 2 controls, run before and after: about
+    (cases + 2) × `num_trials` × 2 rollouts. Catches a fix that backfires; is **not** a
+    measured gain. Val and test are not touched.
+  - `full` — baseline also scores the original seed on val: one extra val evaluation
+    (|val| × `num_trials` rollouts). Gives a real "dry-run effect" number, for capability
+    fixes only.
+  - `off` — no check; the fixes go in unmeasured.
+- **dry_run_unattended** (default `stop`; ask only when the run will be unattended, i.e.
+  `cap-evolve run` or non-interactive orchestrate): `stop` exits `BLOCKED` when a **major**
+  finding outside the editable surface needs approval (minor ones never block); `continue`
+  leaves all of them as is and passes them to the optimizer as hints.
+- **dry_run_verify_cases_per_fix** (`3`) / **dry_run_verify_max_cases** (`12`): tuning keys,
+  taken at their defaults without a question.
+
 - **baseline traces** (optional): prior rollouts to seed diagnosis. Default: none
   (the baseline phase produces them on the first val eval).
 

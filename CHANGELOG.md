@@ -27,6 +27,17 @@ All notable changes to cap-evolve are documented here. The format follows
   did; template placeholders are dropped and the section is capped at 6 KiB. `ao_project_instructions: false`
   turns it off.
 ### Added
+- **Dry run** (`skills/phases/dry-run/`, opt-in with `dry_run: true`): an inspection phase between
+  `implement-and-check` and `baseline` that reads the whole system (capability, agent/runner code,
+  orchestration, scorer) for flow flaws and obvious bugs before any eval budget is spent. Fixes inside the
+  editable capability are applied automatically to a copy of the seed (`dry_run/fixed_seed`, which baseline
+  scores; the user's seed is never modified); fixes to system code, the scorer or the data need a human.
+  `dry_run_verify: targeted` (default) smoke-checks each fix on a few train cases and reverts a harmful
+  editable one; `full` records `baseline_pre_dry_run` on val; `off` skips the check. Unattended runs never
+  apply non-editable fixes and, with `dry_run_unattended: stop`, exit `BLOCKED` on a major one. Unfixed
+  findings reach the optimizer through the new `{{DRY_RUN_FINDINGS}}` placeholder (empty when absent). The
+  report gains a "Dry run" section and `dry_run_*` / `baseline_pre_dry_run` summary keys. `cap-evolve run
+  --skip-dry-run` turns it off for one run. Design: `docs/specs/2026-10-19-dry-run-design.md`.
 - **HC-2/AO-2 gain fixes (search-time diagnosis)**: `hc2_broad_slot` (one proposal per round sees the failing
   traces of ALL clusters), `hc2_cross_traces` (cluster slots also see traces of the other clusters; the
   "address only the cluster below" instruction is gone), `hc2_merge_survivors` (positive-screen candidates of a

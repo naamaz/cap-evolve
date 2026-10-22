@@ -207,6 +207,7 @@ to understand the failure CLASS, then write the general fix.
 {{PASSING}}
 {{CAP_BRIEF}}
 {{ALGO_BRIEF}}
+{{DRY_RUN_FINDINGS}}
 
 ## Self-check before STOP
 - Every kept edit passes the THREE TESTS (REAL, SAFE, VERIFIED) and has its

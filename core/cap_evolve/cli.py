@@ -596,6 +596,8 @@ def _cmd_run(argv):
                         "instead of printing the handoff and returning. Value is the "
                         "host agent (a row in optimizers/registry.yaml, e.g. claude-code). "
                         "Opt-in: omit this flag to keep today's handoff-and-return behavior.")
+    p.add_argument("--skip-dry-run", action="store_true",
+                   help="skip the dry-run phase for this run even when the spec sets dry_run: true")
     p.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default=None,
                    help="verbose/debug logging for cap_evolve itself (per-task/per-trial "
                         "detail on DEBUG), surfaced in each phase/algorithm subprocess's "
@@ -627,6 +629,13 @@ def _cmd_run(argv):
             spec[key] = v
     if args.reuse_baseline is not None:
         spec["reuse_baseline"] = args.reuse_baseline
+    from .dryrun import DryRunConfig as _DryRunConfig
+    try:
+        dry_cfg = _DryRunConfig.from_spec(spec)
+    except ValueError as e:
+        print(json.dumps({"error": str(e), "step": "spec"}))
+        return 1
+    dry_run_on = dry_cfg.enabled and not args.skip_dry_run
 
     if args.dry_run:
         print(json.dumps(_estimate_core(spec, Path(args.project)), indent=2))
@@ -788,6 +797,9 @@ def _cmd_run(argv):
                     "<handoff: agent drives the loop, then runs the finalize phase script>"]
     else:
         sequence = ["intake", "implement-and-check", "baseline", algorithm_name, "finalize", "report"]
+    # The dry run (opt-in, ``dry_run: true``) sits between the check gate and baseline.
+    if dry_run_on:
+        sequence.insert(sequence.index("baseline"), "dry-run")
 
     if args.plan_only:
         print(json.dumps({"skills_dir": str(skills_dir), "workdir": str(workdir),
@@ -852,6 +864,40 @@ def _cmd_run(argv):
             follow_thread.join(timeout=3.0)
         return code
 
+    # 0) dry-run (opt-in): creates the run dir and freezes the split, inspects the system with the
+    # optimizer agent, applies the fixes that need no human, and hands baseline its state.
+    dry_state = None
+    if dry_run_on:
+        dry_cmd = [py, skill_run("dry-run"), "auto", "--base", base, "--project", project,
+                   "--spec", str(spec_path), "--capability", cap_path,
+                   "--seed", str(spec.get("split_seed", 0)), "--ratios", ratios,
+                   "--n-trials", str(spec.get("num_trials", 1)),
+                   "--max-iterations", str(spec.get("max_iterations", 10)),
+                   "--stall", str(spec.get("stall", 0)),
+                   "--max-metric-calls", str(spec.get("max_metric_calls", 0)),
+                   "--max-usd", str(spec.get("max_usd", 0.0)),
+                   "--max-optimizer-usd", str(spec.get("max_optimizer_usd", 0.0)),
+                   "--stop-at-reward", str(spec.get("stop_at_reward", 0.0)),
+                   "--optimizer-cmd", opt_cmd]
+        if spec.get("split_ids_file"):
+            dry_cmd += ["--split-ids", str(spec["split_ids_file"])]
+        if spec.get("workers") is not None:
+            dry_cmd += ["--workers", str(int(spec["workers"]))]
+        if resume_ts:
+            dry_cmd += ["--run-ts", resume_ts]
+        if args.resume:
+            dry_cmd += ["--resume"]
+        proc = run(dry_cmd)
+        if proc.returncode != 0:
+            fail = _step_failure("dry-run", proc)
+            try:
+                fail["dry_run"] = _json_payload(proc.stdout)
+            except json.JSONDecodeError:
+                pass
+            print(json.dumps(fail))
+            return done(1)
+        dry_state = _json_payload(proc.stdout).get("state")
+
     # 1) baseline (creates the run dir; capture its relative path)
     base_cmd = [py, skill_run("baseline"), "--base", base, "--project", project,
                 "--capability", cap_path, "--seed", str(spec.get("split_seed", 0)),
@@ -876,6 +922,8 @@ def _cmd_run(argv):
         base_cmd += ["--run-ts", resume_ts]
     if args.resume:
         base_cmd += ["--resume"]
+    if dry_state:
+        base_cmd += ["--dry-run-state", str(dry_state)]
     proc = run(base_cmd)
     if proc.returncode != 0:
         print(json.dumps({"step": "baseline", "error": proc.stderr[-1500:]}))
@@ -967,11 +1015,16 @@ def _cmd_run(argv):
                 host_cmd += ["--usd-budget", str(float(spec["max_optimizer_usd"]))]
             proc = subprocess.run(host_cmd, cwd=str(workdir))
             return done(proc.returncode)
-        print(json.dumps({"mode": "agent", "run_dir": run_dir, "algorithm": algorithm_name,
-                          "spec_path": str(spec_path), "dashboard": dash_url or "off",
-                          "stop_condition": str(spec.get("stop_condition", "")),
-                          "next": "drive via the orchestrate Agent-mode loop; seal by "
-                                  "running skills/phases/finalize/scripts/run.py"}))
+        handoff = {"mode": "agent", "run_dir": run_dir, "algorithm": algorithm_name,
+                   "spec_path": str(spec_path), "dashboard": dash_url or "off",
+                   "stop_condition": str(spec.get("stop_condition", "")),
+                   "next": "drive via the orchestrate Agent-mode loop; seal by "
+                           "running skills/phases/finalize/scripts/run.py"}
+        if dry_state:
+            # The dry run's as-is findings are hints for the driving agent: fix the editable ones
+            # through the gate like any edit, work with the rest.
+            handoff["dry_run_findings"] = str(Path(run_dir) / "dry_run" / "FINDINGS.md")
+        print(json.dumps(handoff))
         return done(0)
 
     # 2) algorithm (hill-climb variants select their schedule via --focus)

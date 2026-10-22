@@ -15,7 +15,7 @@ from pathlib import Path
 
 import _bootstrap  # noqa: F401
 
-from cap_evolve import RunDir
+from cap_evolve import RunDir, dryrun
 
 
 def _pm(reward, stderr) -> str:
@@ -27,6 +27,39 @@ def _pm(reward, stderr) -> str:
     if reward is None:
         return "None"
     return f"{reward} ± {stderr}" if isinstance(stderr, (int, float)) else f"{reward}"
+
+
+def _dry_run_section(dry: dict, base_val, base_stderr) -> list[str]:
+    """The "Dry run" section. Kept apart from the loop's val → sealed-test result, never added to it."""
+    counts = dry.get("dry_run_counts") or {}
+    fixes = dry.get("dry_run_fixes") or []
+    md = ["", "## Dry run", "",
+          f"- Findings: {counts.get('flow', 0)} flow, {counts.get('bug', 0)} bug — "
+          f"{len(fixes)} fixed, {dry.get('dry_run_as_is', 0)} left as is"
+          + (f", {len(dry['dry_run_reverted'])} reverted after the check" if dry.get("dry_run_reverted") else "")]
+    if fixes:
+        md.append(f"- The seed going into the loop already includes these {len(fixes)} fix(es); "
+                  "the loop's gain above is measured on top of them:")
+        for f in fixes:
+            md.append(f"  - `{f['id']}` in {f['where']} ({', '.join(f['location'])}), approved by {f['approved_by']}")
+    if any(f["where"] == "scorer" for f in fixes):
+        md.append("- **A scorer/metric fix was applied.** Any before/after comparison spans a change "
+                  "in measurement, so it does not show that the agent improved.")
+    smoke = dry.get("dry_run_smoke")
+    if smoke:
+        md.append("- Targeted check — **smoke check on train cases, not a measured gain**:")
+        for fid, v in smoke.items():
+            cases = ", ".join(f"{c['task_id']}{' (control)' if c.get('control') else ''} "
+                              f"{c['before']} → {c['after']}" for c in v["cases"])
+            label = "measurement change" if v["verdict"] == "measurement_change" else v["verdict"]
+            md.append(f"  - `{fid}`: {label}{' — reverted' if v['reverted'] else ''} ({cases})")
+    if dry.get("baseline_pre_dry_run") is not None:
+        md.append(f"- **Dry-run effect, on val:** {_pm(dry['baseline_pre_dry_run'], dry.get('baseline_pre_dry_run_stderr'))}"
+                  f" → {_pm(base_val, base_stderr)} (capability fixes only; system-code and scorer "
+                  "fixes are present on both sides and not measured here)")
+    elif dry.get("dry_run_verify") == "full":
+        md.append("- Dry-run effect on val: not measured (no capability fix was applied).")
+    return md
 
 
 def main(argv=None) -> int:
@@ -114,6 +147,10 @@ def main(argv=None) -> int:
         "iterations": run_dir.spent.iterations,
         "target_profile": target_profile,
     }
+    dry = dryrun.report_summary(run_dir)
+    summary.update({k: dry[k] for k in (
+        "dry_run_ran", "dry_run_fixes", "dry_run_reverted", "dry_run_verify", "dry_run_smoke",
+        "baseline_pre_dry_run", "baseline_pre_dry_run_stderr")})
 
     # pass^k for k > n_trials is UNDEFINED, so aggregate_scores omits it (see
     # loop.aggregate_scores) — never 0.0, which would read as "0% reliable" instead
@@ -176,6 +213,8 @@ def main(argv=None) -> int:
                   + (f" (tier {target_profile['tier']})" if target_profile.get("tier") else ""))
     if finalized:
         md += ["", sealed_note]
+    if dry["dry_run_ran"]:
+        md += _dry_run_section(dry, base_val, base_val_obj.get("stderr"))
     (run_dir.root / "report.md").write_text("\n".join(md) + "\n", encoding="utf-8")
 
     if not args.no_dashboard:

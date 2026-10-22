@@ -56,7 +56,9 @@ gate will correctly reject marginal gains"), so the cost is visible at report ti
    `stop_condition` in agent mode), splits, trials, budget, and `memory_skill`
    (default `md-files`; offer `wiki` — the weakness-graph format, see
    `inputs/INPUTS.md` — when the user wants weaknesses tracked as a persistent graph
-   rather than an append-only journal). `inputs/INPUTS.md` → RECOMMENDED is the
+   rather than an append-only journal), and whether to run the **dry run** (`dry_run`,
+   default `false`; if yes, `dry_run_verify` with the eval cost of each option, and
+   `dry_run_unattended` when nobody will be there to approve). `inputs/INPUTS.md` → RECOMMENDED is the
    authority on each key; SKILL.md only fixes *when* to ask. Define jargon in a
    clause before using it ("pass^k — how often it succeeds on all k tries"); the user
    may be a domain expert, not an ML one.
@@ -87,7 +89,7 @@ coding agent proposes edits), the algorithm (*the search loop*), dataset, splits
    mandate and the cross-iteration file protocol — do not re-author any of them. Your
    three jobs:
    a. keep every `{{...}}` placeholder intact (`{{FOCUS_SUMMARY}}`, `{{FAILURES}}`,
-      `{{CAP_BRIEF}}`, `{{ALGO_BRIEF}}`, `{{BENCH_REPO}}` — the harness fills them per
+      `{{CAP_BRIEF}}`, `{{ALGO_BRIEF}}`, `{{BENCH_REPO}}`, `{{DRY_RUN_FINDINGS}}` — the harness fills them per
       iteration; `implement-and-check`'s pipeline self-test fails if one is deleted,
       and rendering must leave no `{{` behind);
    b. **scope it to the selected capabilities** — delete the sections for capabilities

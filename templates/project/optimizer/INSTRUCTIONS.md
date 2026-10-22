@@ -167,6 +167,7 @@ CLASS, then write the general fix.
 {{PASSING}}
 {{CAP_BRIEF}}
 {{ALGO_BRIEF}}
+{{DRY_RUN_FINDINGS}}
 
 ## Self-check before STOP
 - Every kept edit is REAL (a failing trace shows it) and GENERAL (a class-level rule, no task id or answer),

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import _bootstrap  # noqa: F401
 
+from cap_evolve.dryrun import DryRunConfig
 from cap_evolve.specfile import read_yaml
 
 # Tokens not produced by any skill — supplied by intake / the project adapter.
@@ -54,7 +55,11 @@ def _resolve_algorithm(name: str) -> str:
 
 def build_sequence(spec: dict) -> list[str]:
     algo = _resolve_algorithm(spec.get("algorithm_skill", "hill-climb"))
-    return [algo if s == "<algorithm>" else s for s in PHASE_ORDER]
+    seq = [algo if s == "<algorithm>" else s for s in PHASE_ORDER]
+    # The optional dry run (``dry_run: true``) inspects the system between the check gate and baseline.
+    if DryRunConfig.from_spec(spec).enabled:
+        seq.insert(seq.index("baseline"), "dry-run")
+    return seq
 
 
 def validate_dag(sequence: list[str], manifest: dict) -> dict:
@@ -107,6 +112,7 @@ def main(argv=None) -> int:
         "focus": spec.get("algorithm_focus"),
         "gate_mode": spec.get("gate_mode", "auto"),  # auto → harness uses the paired per-task gate
         "budget": {"max_iterations": spec.get("max_iterations"), "stall": spec.get("stall")},
+        "dry_run": spec.get("dry_run", False),
         "rule": "cap-evolve check must be green before baseline; test scored once at finalize.",
     }
 

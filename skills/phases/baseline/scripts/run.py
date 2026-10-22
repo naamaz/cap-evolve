@@ -18,31 +18,49 @@ from cap_evolve import Budget, RunDir, harness
 from cap_evolve.check import load_adapter, run_check
 
 
-def _refuse_degenerate_split(splits, run_dir) -> bool:
-    """Refuse a ratio split with no val or no test; warn on a tiny val (#113).
+def _dry_run_comparison(adapter, run_dir, dry: dict, *, n_trials: int, workers, reuse_from) -> dict | None:
+    """``dry_run_verify: full``: score the ORIGINAL (pre-fix) seed on the same split as the fixed seed.
 
-    A val-gated run with zero val tasks has nothing to decide on, and a sealed-test
-    run with zero test tasks produces its headline number over nothing — both fail
-    silently today because ``make_splits`` clamps sizes without a floor
-    (``splits.py:113-119``). Failing here costs nothing; failing at finalize costs the
-    whole run. A pinned ``--split-ids`` may be deliberately degenerate (the no-holdout
-    case), so only the ratio path is guarded.
+    Same frozen split, same trial count, the same stratum the seed was just scored on (val, or F in
+    ``split_mode: pooled``; the confirm stratum and test are never touched). Recorded as
+    ``baseline_pre_dry_run`` in ``baseline.json``. Only capability fixes are measured: fixes applied to
+    system code or the scorer are present on both sides. A ``--reuse-baseline`` prior run stands in for
+    the "before" score only when its seed is byte-identical to the original seed and no system fix was
+    applied (the prior run measured the system without it).
     """
-    if not splits.val or not splits.test:
-        msg = (f"degenerate ratio split: train={len(splits.train)} val={len(splits.val)} "
-               f"test={len(splits.test)} — the val gate and the sealed test number both "
-               "need at least one task. Add tasks, change --ratios, or pin --split-ids "
-               "deliberately.")
-        run_dir.log_event("splits_warning", msg=msg)
-        print(json.dumps({"step": "baseline", "error": msg}, indent=2), file=sys.stderr)
-        return True
-    if len(splits.val) < 5:
-        run_dir.log_event(
-            "splits_warning",
-            msg=(f"val has only {len(splits.val)} task(s) — the gate's Δ > k·SE bar is "
-                 "optimistic at this n, and a one-task improvement cannot reliably clear "
-                 "it at all (#351). Prefer >= 5 val tasks."))
-    return False
+    from cap_evolve import dryrun
+    from cap_evolve.cache import hash_candidate_dir
+    if dry.get("verify") != "full":
+        return None
+    path = run_dir.root / "baseline.json"
+    base = json.loads(path.read_text(encoding="utf-8"))
+    if not dry.get("seed_dir"):
+        base["baseline_pre_dry_run_note"] = ("not measured: the dry run applied no capability fix, so "
+                                             "the original and fixed seeds are the same bytes")
+        path.write_text(json.dumps(base, indent=2), encoding="utf-8")
+        return None
+    split = base.get("split") or "val"
+    pre = None
+    if reuse_from is not None and not dry.get("n_system_fixes"):
+        prior_seed = Path(reuse_from) / "candidates" / "seed"
+        prior_base = Path(reuse_from) / "baseline.json"
+        if (prior_seed.is_dir() and prior_base.exists()
+                and hash_candidate_dir(prior_seed) == dry.get("original_seed_hash")):
+            pre = (json.loads(prior_base.read_text(encoding="utf-8")).get("val") or None)
+            if pre is not None:
+                base["baseline_pre_dry_run_source"] = f"reused from {reuse_from} (same seed bytes)"
+    if pre is None:
+        run_dir.snapshot(dryrun.CAND_PRE, Path(dry["original_seed"]))
+        res = harness.evaluate_candidate(adapter, run_dir.candidate_dir(dryrun.CAND_PRE), run_dir=run_dir,
+                                         split=split, n_trials=n_trials, tag=dryrun.CAND_PRE,
+                                         workers=workers)
+        pre = res.to_dict()
+    base["baseline_pre_dry_run"] = pre
+    base["baseline_pre_dry_run_scope"] = "capability fixes only; system-code and scorer fixes are on both sides"
+    path.write_text(json.dumps(base, indent=2), encoding="utf-8")
+    run_dir.log_event("baseline_pre_dry_run", val=pre.get("reward"), stderr=pre.get("stderr"),
+                      split=split, fixed_val=(base.get("val") or {}).get("reward"))
+    return pre
 
 
 def main(argv=None) -> int:
@@ -75,6 +93,9 @@ def main(argv=None) -> int:
                         "eval when it already ran (baseline.json present)")
     p.add_argument("--spec", default=None,
                    help="path to capevolve.yaml spec (for observer config)")
+    p.add_argument("--dry-run-state", default=None,
+                   help="the dry-run phase's state.json: reuse its run dir and frozen split, and "
+                        "score its fixed seed (when it applied capability fixes) instead of --capability")
     args = p.parse_args(argv)
 
     # The hard gate, on THIS path too. `cap-evolve run` checks the adapter before it
@@ -93,7 +114,19 @@ def main(argv=None) -> int:
     budget = Budget(max_iterations=args.max_iterations, stall=args.stall,
                     max_metric_calls=args.max_metric_calls, max_usd=args.max_usd,
                     max_optimizer_usd=args.max_optimizer_usd, stop_at_reward=args.stop_at_reward)
-    run_dir = RunDir.create(Path(args.base), ts=args.run_ts, budget=budget, exist_ok=args.resume)
+    dry = None
+    if args.dry_run_state:
+        # The dry run already created the run dir (its evals and its split live there) and froze the
+        # split. Reopen it; never create a second one.
+        from cap_evolve import dryrun
+        try:
+            dry = dryrun.for_baseline(args.dry_run_state)
+        except dryrun.DryRunError as e:
+            print(json.dumps({"step": "baseline", "error": str(e)}, indent=2), file=sys.stderr)
+            return 1
+        run_dir = RunDir.open(Path(dry["applied_run_dir"]))
+    else:
+        run_dir = RunDir.create(Path(args.base), ts=args.run_ts, budget=budget, exist_ok=args.resume)
 
     # Pin the spec to the run NOW. Everything that reads config through specfile.spec_for_run (split_mode,
     # coverage/budget switches, the P2 keys) resolves the spec from the run dir's events, and the CLI logs
@@ -169,9 +202,18 @@ def main(argv=None) -> int:
 
         adapter = load_adapter(Path(args.project))
 
+        # A dry run that applied a fix hands baseline a different system: a NEW seed
+        # (dry_run/fixed_seed) and/or changed system code. A prior run's baseline measured the old
+        # one, so it cannot stand in for this run's seed score.
+        dry_seed = (dry or {}).get("seed_dir")
+        dry_changed = bool((dry or {}).get("n_fixes"))
+        if args.reuse_baseline and dry_changed:
+            run_dir.log_event("reuse_baseline_ignored", prior_run_dir=str(args.reuse_baseline),
+                              reason="the dry run applied fixes; the seed is scored fresh")
+
         # --reuse-baseline: copy a prior run's frozen split + baseline + seed snapshot +
         # seed val rollouts into this fresh run dir and SKIP the (expensive) baseline eval.
-        if args.reuse_baseline:
+        if args.reuse_baseline and not dry_changed:
             result = harness.reuse_baseline(Path(args.reuse_baseline), run_dir=run_dir)
             splits = run_dir.read_splits()
             print(json.dumps({
@@ -197,7 +239,8 @@ def main(argv=None) -> int:
             split_ids = json.loads(sp.read_text(encoding="utf-8"))
         splits = harness.ensure_splits(adapter, run_dir, seed=args.seed, ratios=ratios,
                                        split_ids=split_ids)
-        if split_ids is None and _refuse_degenerate_split(splits, run_dir):
+        # (A dry run froze — and already vetted — this split; baseline only reloads it.)
+        if split_ids is None and dry is None and harness.refuse_degenerate_split(splits, run_dir, step="baseline"):
             return 1
         # Resolve the seed capability dir robustly: as given (absolute/cwd-relative),
         # else relative to the project dir. `cap-evolve run` invokes baseline with
@@ -208,6 +251,8 @@ def main(argv=None) -> int:
             cand = Path(args.project) / args.capability
             if cand.exists():
                 cap_path = cand
+        if dry_seed:
+            cap_path = Path(dry_seed)
         from cap_evolve import gatecfg
         if gatecfg.GateConfig.for_run(run_dir).split_mode == "pooled":
             # split_mode: pooled -> pool = train + val, partitioned once into F and C; the seed is
@@ -215,12 +260,17 @@ def main(argv=None) -> int:
             from cap_evolve import promotion as _promotion
             from cap_evolve.specfile import spec_for_run as _spec_for_run
             _p2 = _promotion.P2Params.from_spec({**(_spec_for_run(run_dir) or {}), "promotion_rule": "P2"})
+            seed_trials = max(args.n_trials, _p2.incumbent_trials)
             result = harness.baseline_pooled(adapter, cap_path, run_dir=run_dir,
-                                             n_trials=max(args.n_trials, _p2.incumbent_trials),
-                                             workers=args.workers)
+                                             n_trials=seed_trials, workers=args.workers)
         else:
+            seed_trials = args.n_trials
             result = harness.baseline(adapter, cap_path, run_dir=run_dir, n_trials=args.n_trials,
                                        workers=args.workers)
+        pre = None
+        if dry is not None:
+            pre = _dry_run_comparison(adapter, run_dir, dry, n_trials=seed_trials, workers=args.workers,
+                                      reuse_from=Path(args.reuse_baseline) if args.reuse_baseline else None)
 
         # Materialize ./guidance/<cap>/SKILL.md (+ diagnose + capability_sources) into the
         # RUN dir itself, once, here — regardless of orchestration_mode. Deterministic mode
@@ -253,13 +303,18 @@ def main(argv=None) -> int:
                    else "floor" if result.reward <= 0.0 else "ok")
         run_dir.log_event("headroom", headroom=headroom, verdict=verdict, val=result.reward)
 
-        print(json.dumps({
+        out = {
             "run_dir": str(run_dir.root),
             "splits": {"train": len(splits.train), "val": len(splits.val), "test": len(splits.test)},
             "baseline_val": result.to_dict(),
             "headroom": headroom,
             "headroom_verdict": verdict,
-        }, indent=2))
+        }
+        if dry is not None:
+            out["dry_run"] = {"seed": str(cap_path), "n_fixes": dry.get("n_fixes", 0),
+                              "baseline_pre_dry_run": (pre or {}).get("reward"),
+                              "baseline_pre_dry_run_stderr": (pre or {}).get("stderr")}
+        print(json.dumps(out, indent=2))
         return 0
     finally:
         close_observers = getattr(run_dir, "close_observers", None)

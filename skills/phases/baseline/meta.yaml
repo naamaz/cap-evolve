@@ -5,6 +5,7 @@ entry: scripts/run.py
 abstract: scripts/abstract.py
 check: scripts/check.py
 needs: [project, tasks]
+# optional: dry_run_findings + the dry run's frozen split (--dry-run-state), when the dry-run phase ran
 provides: [splits, baseline, candidate, scores, traces]
 compatible_with:
   capabilities: ["*"]

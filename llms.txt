@@ -14,7 +14,7 @@ write and `live` a context manager, `apply` a back-compat hook), wire
 `capability_sources` (data-model files the tools import), and author a
 capability-scoped `optimizer/INSTRUCTIONS.md`; see `docs/ADAPTER_CONTRACT.md`. Pass
 `cap-evolve check` (the hard gate), then run the phases intake → implement-and-check
-→ baseline → <algorithm> → finalize → report. Each iteration the optimizer gets the
+→ [dry-run, optional] → baseline → <algorithm> → finalize → report. Each iteration the optimizer gets the
 current best step's full trajectories, the selected capability skills, the per-task
 impact of prior edits + the passing set to protect, and a STATE/MEMORY handover; it
 may edit BOTH the prompt and the tools (incl. tool code). Never score the test split
@@ -31,11 +31,12 @@ except at finalize; gate acceptance on val with a paired significance gate.
 - [CONTRIBUTING.md](CONTRIBUTING.md): dev setup and house rules.
 - [docs/ROADMAP.md](docs/ROADMAP.md): prioritized next work.
 
-## Skills (22)
+## Skills (23)
 Counting rule: one skill = one skills/<component>/<name>/SKILL.md, i.e. every row of
 skills/_registry/manifest.json — phases + capabilities + algorithms + optimizers +
 interventions + orchestrate.
-- phases: intake, implement-and-check, baseline, evaluate, diagnose, gate, finalize, report
+- phases: intake, implement-and-check, dry-run (optional: read the system for flow flaws and
+  obvious bugs before baseline), baseline, evaluate, diagnose, gate, finalize, report
 - capabilities: system-prompt, skill-package, tools, mcp-tool
 - interventions: blackbox (how a candidate is DELIVERED to the model under test, vs what is edited)
 - memory: wiki (which cross-iteration memory scheme, selected via `memory_skill` —

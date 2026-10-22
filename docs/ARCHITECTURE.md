@@ -86,7 +86,7 @@ heatmap, per-iteration git diffs, the lineage tree, and gate decisions.
 
 ## Skill library
 
-22 skills · 5 algorithms (3 run-executable + 2 agent-mode) · 14 optimizer backends, all over
+23 skills · 5 algorithms (3 run-executable + 2 agent-mode) · 14 optimizer backends, all over
 the core. Extending is one folder or one registry row — see [`EXTENDING.md`](EXTENDING.md).
 
 **How the counts are defined.** A *skill* is one `skills/<component>/<name>/SKILL.md`, i.e.
@@ -105,7 +105,7 @@ above is checkable rather than remembered.
 | Component | Skills |
 |---|---|
 | orchestrate | `orchestrate` · `using-cap-evolve` |
-| phases | `intake` · `implement-and-check` · `baseline` · `evaluate` · `diagnose` · `gate` · `finalize` · `report` |
+| phases | `intake` · `implement-and-check` · `dry-run` · `baseline` · `evaluate` · `diagnose` · `gate` · `finalize` · `report` |
 | capabilities | `system-prompt` · `skill-package` · `tools` · `mcp-tool` |
 | algorithms | `hill-climb` (`--focus all\|cyclic\|hardest-first`) · `gepa` · `skillopt` · `agent-optimize` (agent mode only) · ~~`evograph`~~ (deprecated — use `agent-optimize`) |
 | optimizers | `run-optimizer` + `optimizers/registry.yaml` (14 backends incl. `mock`) |

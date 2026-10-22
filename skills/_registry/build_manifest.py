@@ -39,7 +39,7 @@ COMPONENTS = {"phase", "capability", "algorithm", "optimizer", "orchestrate", "i
 # breaking the orchestrate DAG.
 TOKENS = {
     "project", "tasks", "splits", "baseline", "candidate", "scores", "traces",
-    "reflective_dataset", "decision", "report", "checked",
+    "reflective_dataset", "decision", "report", "checked", "dry_run_findings",
 }
 
 REQUIRED = ["component", "name", "entry", "check"]

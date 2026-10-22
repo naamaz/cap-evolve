@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Drive the entire cap-evolve pipeline end to end, autonomously. Use when the user wants the whole optimization run with minimal hand-holding. Sequences intake → implement-and-check → baseline → the chosen algorithm loop → finalize → report, enforces the cap-evolve-check hard gate before spending budget, decides when to stop (budget/stall), and surfaces the honest test number at the end. Reads capevolve.yaml; respects the ask-user-if-missing rule for inputs.
+description: Drive the entire cap-evolve pipeline end to end, autonomously. Use when the user wants the whole optimization run with minimal hand-holding. Sequences intake → implement-and-check → the optional dry-run → baseline → the chosen algorithm loop → finalize → report, enforces the cap-evolve-check hard gate before spending budget, decides when to stop (budget/stall), and surfaces the honest test number at the end. Reads capevolve.yaml; respects the ask-user-if-missing rule for inputs.
 component: orchestrate
 argument-hint: "--spec .capevolve/project/capevolve.yaml [--execute]"
 allowed-tools: Read, Write, Edit, Bash
@@ -29,8 +29,13 @@ the operator to remember each one.
    input** (never fabricate one).
 2. **implement-and-check** — implement the adapter; **`cap-evolve check` must be green**
    (HARD GATE — do not advance until `{"ok": true}`).
+   **dry-run** (only when `dry_run: true`) — read the whole system for flow flaws and
+   obvious bugs before any budget is spent (`skills/phases/dry-run/SKILL.md`). Editable
+   fixes apply automatically to a seed copy; ask the user before any other change. In
+   non-interactive mode, a major finding that needs approval stops the run (`BLOCKED`).
 3. **baseline** — freeze the split (once, seeded), score the seed on val, check
-   **headroom** (stop early if the seed already saturates val).
+   **headroom** (stop early if the seed already saturates val). After a dry run, pass
+   `--dry-run-state <project>/dry_run/state.json` so baseline reuses its run dir and split.
 4. **\<algorithm\>** — run the loop named in `capevolve.yaml` (default `all-at-once`):
    propose → evaluate(val) → diagnose → gate → accept/reject, until budget/stall.
    Acceptance is **always on val**, by significance (Δ > k·SE).

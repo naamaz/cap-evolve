@@ -15,15 +15,31 @@ skill, prompt, or CLI flag in either mode.
 
 ## Deterministic mode (default)
 
-`cap-evolve run` sequences the phases itself: `intake → implement-and-check → baseline →
-<algorithm> → finalize → report`. A per-iteration **optimizer** subprocess (e.g. `claude-code`,
+`cap-evolve run` sequences the phases itself: `intake → implement-and-check → [dry-run] →
+baseline → <algorithm> → finalize → report` (`dry-run` only with `dry_run: true`; see below). A per-iteration **optimizer** subprocess (e.g. `claude-code`,
 `codex`, or `mock`) proposes each edit; the engine evaluates on val, applies the gate, and
 accepts/rejects. This is the right choice when the schedule is known and you want a hands-off,
 reproducible run. Algorithms: `hill-climb`, `gepa`, `skillopt`.
 
+## The optional dry run (`dry_run: true`)
+
+Before baseline, the `dry-run` phase (`skills/phases/dry-run/SKILL.md`) reads the whole system —
+capability, agent and runner code, orchestration, scorer — for flow flaws (a score computed and then
+ignored, a retry with no exit) and obvious bugs. Fixes inside the editable surface are applied with
+no question to a copy of the seed (`dry_run/fixed_seed`, which baseline scores); fixes outside it
+(system code, the scorer, the data) need a human. `dry_run_verify` picks how the fixes are checked:
+`targeted` (a smoke check on a few train cases, default), `full` (original vs fixed seed on val) or
+`off`. Findings left as they are reach the optimizer as hints (`{{DRY_RUN_FINDINGS}}`; in agent mode
+the handoff carries `dry_run_findings`, the path to `FINDINGS.md`).
+
+Under `cap-evolve run` nobody is there to ask: the phase starts the configured optimizer CLI on the
+SKILL.md, applies only editable fixes, and with `dry_run_unattended: stop` (default) exits
+`BLOCKED` when a major finding outside the editable surface needs approval. `--skip-dry-run`
+turns the phase off for one run.
+
 ## Agent mode
 
-`cap-evolve run` does `check → baseline`, prints a handoff (`run_dir`, `algorithm`,
+`cap-evolve run` does `check → [dry-run] → baseline`, prints a handoff (`run_dir`, `algorithm`,
 `stop_condition`), and **returns** — no algorithm subprocess, no auto-finalize. From there the
 **same conversational agent that ran intake drives the optimization itself**, following the
 selected algorithm's *Agent-mode loop* section. It is *not* a new spawned agent and it does *not*

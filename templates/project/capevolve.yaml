@@ -63,6 +63,17 @@ capability_sources: []
 #  working dir as ./trajectories/ — via your adapter's trajectories(split) hook, else
 #  cap-evolve's own per-rollout JSON. No config needed.)
 
+# --- dry run: read the system before baseline (optional, OFF by default) -----
+# Inspects the whole system (capability, agent/runner code, orchestration, scorer) for flow
+# flaws and obvious bugs before any eval budget is spent (skills/phases/dry-run/SKILL.md).
+# Fixes inside the editable capability are applied automatically, to a copy of the seed;
+# anything else (system code, scorer, data) needs a human. Unfixed findings become optimizer hints.
+dry_run: false
+dry_run_verify: targeted          # off | targeted (smoke check on a few TRAIN cases) | full (original vs fixed seed on val)
+dry_run_unattended: stop          # cap-evolve run, nobody to ask: stop (BLOCKED on a major non-editable finding) | continue
+dry_run_verify_cases_per_fix: 3   # targeted: train cases per fix
+dry_run_verify_max_cases: 12      # targeted: total cases (2 control tasks are added on top)
+
 # --- data + splits ----------------------------------------------------------
 dataset_source: tasks.jsonl              # file/dir, or "adapter" to use tasks()
 split_seed: 0

@@ -526,6 +526,12 @@ def _shared_blocks(ctx, run_dir: Path, context: dict) -> str:
     empty = ctx.empty_seed_brief(run_dir / "candidates" / "seed")
     if empty:
         parts.append(empty)
+    if (run_dir / "dry_run" / "FINDINGS.md").exists():
+        from cap_evolve import dryrun
+        hints = dryrun.hints_for_run(run_dir)
+        if hints:
+            parts.append(hints + f"\nFull findings, with diffs and the targeted-check results: "
+                                 f"`{run_dir / 'dry_run' / 'FINDINGS.md'}`.")
     return "\n\n".join(p.strip() for p in parts if p and p.strip())
 
 

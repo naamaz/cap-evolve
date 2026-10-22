@@ -1,0 +1,12 @@
+component: phase
+name: dry-run
+summary: Optional, before baseline. Read the whole system for flow flaws and obvious bugs; fix what the optimizer may edit, ask about the rest.
+entry: scripts/run.py
+abstract: scripts/abstract.py
+check: scripts/check.py
+needs: [project, checked]
+provides: [dry_run_findings]
+compatible_with:
+  capabilities: ["*"]
+  optimizers: ["*"]
+  algorithms: ["*"]

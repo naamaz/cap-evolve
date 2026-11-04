@@ -374,6 +374,46 @@ def resolve_errored_policy(explicit=None, run_dir=None) -> str:
     return pol
 
 
+FEEDBACK_SPLIT_ENV = "CAPEVOLVE_FEEDBACK_SPLIT"
+FEEDBACK_SPLITS = ("val", "train")
+FEEDBACK_CHARS_ENV = "CAPEVOLVE_FEEDBACK_CHARS"
+_DEFAULT_FEEDBACK_CHARS = 400
+
+
+def resolve_feedback_split(run_dir=None) -> str:
+    """Which split the PROPOSER reads: env ``CAPEVOLVE_FEEDBACK_SPLIT`` > spec
+    ``feedback_split`` > ``val``.
+
+    ``val`` (default) is today's behaviour: the optimizer reads the parent's val traces and
+    the gate scores on val, so the gate set is also the set it tunes against. ``train``
+    shows the optimizer the parent's TRAIN traces and per-task rewards instead; the gate
+    still scores on val only, so val stops being something the proposer has seen. The
+    parent's train rollouts are evaluated once per new best (``_ensure_feedback_split``)."""
+    v = os.environ.get(FEEDBACK_SPLIT_ENV)
+    if not v and run_dir is not None:
+        from .specfile import spec_for_run
+        v = (spec_for_run(run_dir) or {}).get("feedback_split")
+    v = str(v or "val").strip().lower()
+    if v not in FEEDBACK_SPLITS:
+        raise ValueError(f"feedback_split must be one of {FEEDBACK_SPLITS}, got {v!r}")
+    return v
+
+
+def resolve_feedback_chars(run_dir=None) -> int:
+    """Per-task feedback characters in the prompt's failure index: env
+    ``CAPEVOLVE_FEEDBACK_CHARS`` > spec ``feedback_chars`` > 400. ``0`` = no cap."""
+    v = os.environ.get(FEEDBACK_CHARS_ENV)
+    if not v and run_dir is not None:
+        from .specfile import spec_for_run
+        v = (spec_for_run(run_dir) or {}).get("feedback_chars")
+    if v in (None, ""):
+        return _DEFAULT_FEEDBACK_CHARS
+    n = int(v)
+    if n < 0:
+        raise ValueError(f"feedback_chars must be >= 0, got {n}")
+    return n
+
+
 def candidate_attributed_error(metadata) -> bool:
     """Did the adapter attribute this trial's error to the candidate (see ``CANDIDATE_ERROR_KIND``)?"""
     return isinstance(metadata, dict) and metadata.get("error_kind") == CANDIDATE_ERROR_KIND
@@ -586,6 +626,9 @@ def _evaluate_candidate(
     # collect per-task trial rewards (+ last rollout/score) across trials
     per_task_trials: dict[str, list[float]] = {t.id: [] for t in tasks}
     per_task_feedback: dict[str, str] = {t.id: "" for t in tasks}
+    # Every trial's feedback, not just the last one's: the reward is a mean over trials, so a
+    # proposer shown only the last trial's text cannot see why the other trials scored lower.
+    per_task_trial_feedback: dict[str, list[str]] = {t.id: [] for t in tasks}
     per_task_metrics: dict[str, list] = {t.id: [] for t in tasks}  # per-trial metric catalogs
     per_task_errored: dict[str, bool] = {t.id: False for t in tasks}  # any trial an infra error?
     per_task_errored_trials: dict[str, int] = {t.id: 0 for t in tasks}  # how many trials errored
@@ -693,6 +736,10 @@ def _evaluate_candidate(
                 per_task_trials[tid].append(0.0 if cand_fail else sc.reward)
                 per_task_metrics[tid].append([] if cand_fail else sc.metrics)
             per_task_feedback[tid] = sc.feedback or per_task_feedback[tid]
+            if sc.feedback:
+                per_task_trial_feedback[tid].append(
+                    f"[trial {trial_offset + k}, reward {float(sc.reward or 0):.3f}] "
+                    f"{str(sc.feedback).strip()}")
             # #589: per-task/per-trial detail, opt-in via CAPEVOLVE_LOG_LEVEL=DEBUG
             # (see cap_evolve/__init__.py) — a no-op call when logging isn't enabled.
             logger.debug("split=%s tag=%s task=%s trial=%s reward=%s errored=%s",
@@ -809,7 +856,8 @@ def _evaluate_candidate(
                  "n_trials": n_trials,
                  # mean cost_usd over this task's trials (#676); None, not 0.0, when no
                  # trial ran at all so a missing measurement never reads as free.
-                 "cost_usd": (mean(per_task_cost[tid]) if per_task_cost[tid] else None)},
+                 "cost_usd": (mean(per_task_cost[tid]) if per_task_cost[tid] else None),
+                 "trial_feedback": per_task_trial_feedback[tid]},
             metrics=_aggregate_metrics(per_task_metrics[tid], mean(tr)),
         ))
 
@@ -876,6 +924,7 @@ def split_result_from_rollouts(run_dir: RunDir, tag, split: str = "val", ks=(1, 
     vdir = run_dir.rollout_dir(split)
     by_task: dict[str, list[float]] = {}
     feedback: dict[str, str] = {}
+    trial_fb: dict[str, list[str]] = {}
     raw: dict[str, dict] = {}
     metrics_by_task: dict[str, list] = {}
     cost_by_task: dict[str, list[float]] = {}  # #676: per-task cost, every trial counts
@@ -887,6 +936,10 @@ def split_result_from_rollouts(run_dir: RunDir, tag, split: str = "val", ks=(1, 
             sc = rec.get("score", {})
             tid = sc.get("task_id") or f.name.split("__")[0]
             feedback[tid] = sc.get("feedback", feedback.get(tid, ""))
+            if sc.get("feedback"):
+                trial_fb.setdefault(tid, []).append(
+                    f"[trial {f.stem.rsplit('__t', 1)[1]}, reward {float(sc.get('reward') or 0):.3f}] "
+                    f"{str(sc['feedback']).strip()}")
             cost_by_task.setdefault(tid, []).append(
                 float((rec.get("rollout") or {}).get("cost_usd") or 0.0))
             # carry the structured infra flag + trial counts forward across resume.
@@ -922,6 +975,7 @@ def split_result_from_rollouts(run_dir: RunDir, tag, split: str = "val", ks=(1, 
     for tid, r0 in raw.items():
         r0["valid_trials"] = len(by_task.get(tid, []))
         r0["cost_usd"] = mean(cost_by_task[tid]) if cost_by_task.get(tid) else None
+        r0["trial_feedback"] = trial_fb.get(tid, [])
     scores = [Score(task_id=t, reward=mean(r), feedback=feedback.get(t, ""),
                     n=len(r), stderr=stderr(r), trial_rewards=r, raw=raw.get(t, {}),
                     metrics=_aggregate_metrics(metrics_by_task.get(t, []), mean(r)))
@@ -2664,8 +2718,13 @@ def _build_runmap(workdir: Path, run_dir: RunDir) -> None:
         "`./prior_iterations/<candidate>/`:\n"
         "- `PROCESS.md` — what that iteration did (ranked issues, changes, verify-the-fix, process)\n"
         "- `diff.patch` — the EXACT capability edit it made vs its parent\n\n"
-        f"The live run dir (read-only) is at `{run_dir.root}` if you need "
-        "`rollouts/<split>/` traces or the git log.\n\n"
+        + (f"The live run dir (read-only) is at `{run_dir.root}` if you need "
+           "`rollouts/<split>/` traces or the git log.\n\n"
+           if resolve_feedback_split(run_dir) == "val" else
+           f"The live run dir (read-only) is at `{run_dir.root}` for the git log and "
+           f"`rollouts/{resolve_feedback_split(run_dir)}/` traces only. Do NOT read "
+           "`rollouts/val/` or `rollouts/test/`: val is the held-out gate set for this run, "
+           "and tuning to it is what the gate exists to catch.\n\n")
         + "\n".join(table) + "\n\n"
         "Before proposing, read the PROCESS.md + diff.patch of the prior iterations that "
         "targeted the SAME cluster you are about to work on — so you BUILD ON them rather "
@@ -4148,9 +4207,22 @@ def _classify(per):
     return errored, always_fail, flaky, solid
 
 
-def _fmt(pt) -> str:
-    return f"- {pt.get('task_id')} (reward {float(pt.get('reward', 0) or 0):.2f}): " \
-           f"{str(pt.get('feedback', '')).strip()[:400]}"
+def _fmt(pt, max_chars: int = _DEFAULT_FEEDBACK_CHARS) -> str:
+    """One failure-index line: the task's mean reward + its feedback.
+
+    Every trial's feedback (``raw.trial_feedback``) when the evaluation recorded it, else
+    the last trial's. ``max_chars`` caps each trial's text (0 = no cap); the full text is
+    always in ./trajectories/."""
+    head = f"- {pt.get('task_id')} (reward {float(pt.get('reward', 0) or 0):.2f}): "
+    per_trial = [str(x) for x in ((pt.get("raw") or {}).get("trial_feedback") or []) if x]
+    texts = per_trial or [str(pt.get("feedback", "")).strip()]
+
+    def cap(s: str) -> str:
+        s = s.strip()
+        return s if not max_chars or len(s) <= max_chars else s[:max_chars] + " …[truncated]"
+    if len(texts) == 1:
+        return head + cap(texts[0])
+    return head + f"{len(texts)} trials\n" + "\n".join("  " + cap(t) for t in texts)
 
 
 def _passing_block(solid, *, max_ids: int = 60) -> str:
@@ -4207,20 +4279,25 @@ _SNAPSHOT_IGNORE = ("trajectories", "guidance", "prior_iterations",
                     "CLAUDE.md", "AGENTS.md", "GEMINI.md")
 
 
-def _failures_block(always_fail, flaky, errored) -> str:
+def _failures_block(always_fail, flaky, errored, *, max_chars: int = _DEFAULT_FEEDBACK_CHARS,
+                    split: str = "val") -> str:
     """The per-iteration (a)/(b)/errored failure index for the prompt."""
     lines: list[str] = []
+    multi = any((pt.get("raw") or {}).get("trial_feedback") for pt in always_fail + flaky)
+    where = f"full traces of the {split} split in ./trajectories/"
     if always_fail:
         lines.append(f"## (a) {len(always_fail)} ALWAYS-failing task(s) — fix the shared "
-                     "root cause (full traces in ./trajectories/):")
-        lines += [_fmt(pt) for pt in always_fail[:10]]
+                     f"root cause ({where}):")
+        lines += [_fmt(pt, max_chars) for pt in always_fail[:10]]
         lines.append("")
     if flaky:
         lines.append(f"## (b) {len(flaky)} FLAKY task(s) — pass sometimes; make the good "
-                     "behavior consistent (full traces in ./trajectories/):")
-        lines.append("(reward is the mean over trials — the honest signal; the feedback line is "
+                     f"behavior consistent ({where}):")
+        lines.append("(reward is the mean over trials — the honest signal; each trial's feedback "
+                     "is listed with its own reward.)" if multi else
+                     "(reward is the mean over trials — the honest signal; the feedback line is "
                      "from the LAST trial and may say 'passed' even when the mean is below 1.)")
-        lines += [_fmt(pt) for pt in flaky[:8]]
+        lines += [_fmt(pt, max_chars) for pt in flaky[:8]]
         lines.append("")
     if not always_fail and not flaky:
         lines.append("## No actionable failures in focus — seek a robustness/generalization gain "
@@ -4673,7 +4750,8 @@ def _focus_instructions(current_val: SplitResult, focus_ids, label: str,
                         instructions_file=None, bench_repo: str | None = None,
                         optimizer_name: str | None = None,
                         seed_empty: bool | None = None,
-                        target_reader: str = "") -> str:
+                        target_reader: str = "",
+                        feedback_chars: int = _DEFAULT_FEEDBACK_CHARS) -> str:
     """Render one iteration's INSTRUCTIONS by substituting dynamic blocks into the
     optimizer-instructions template.
 
@@ -4697,13 +4775,18 @@ def _focus_instructions(current_val: SplitResult, focus_ids, label: str,
     # The counts are over the FOCUS SET; ``_passing_block`` below counts the whole val
     # split. Say which, or a narrow focus renders "0 solid" one line above
     # "Currently PASSING (1 task(s))" and the prompt contradicts itself.
-    scope = "tasks" if focus_ids is None else f"focused task(s) of {len(per_all)} on val"
+    split = current_val.split or "val"
+    scope = "tasks" if focus_ids is None else f"focused task(s) of {len(per_all)} on {split}"
     focus_summary = (
-        f"Focus: {label}. Current val reward {current_val.reward:.3f}: "
+        f"Focus: {label}. Current {split} reward {current_val.reward:.3f}: "
         f"{len(solid)} solid / {len(flaky)} flaky / {len(always_fail)} failing"
         + (f" / {len(errored)} infra-errored" if errored else "") + f" of {n} {scope}."
     )
-    failures = _failures_block(always_fail, flaky, errored)
+    if split != "val":
+        focus_summary += (f" These are the parent's {split.upper()} results; the gate scores your "
+                          "candidate on a held-out val split you are not shown, so a fix must "
+                          "generalize beyond these tasks.")
+    failures = _failures_block(always_fail, flaky, errored, max_chars=feedback_chars, split=split)
     passing = _passing_block(protect) if history_enabled() else ""
     cap = _capability_brief(capabilities)
     algo = _algorithm_brief(current_val, algorithm)
@@ -4821,6 +4904,7 @@ class OptimizerContext:
     bench_repo: str | None = None
     target_reader: str = ""
     memory_skill: str = "md-files"
+    feedback_chars: int = _DEFAULT_FEEDBACK_CHARS   # per-trial cap in the failure index; 0 = none
 
     # ---- construction from an algorithm run.py --------------------------------
 
@@ -4886,6 +4970,7 @@ class OptimizerContext:
             bench_repo=getattr(args, "bench_repo", None),
             target_reader=_tp.reader_block(profile),
             memory_skill=getattr(args, "memory_skill", None) or "md-files",
+            feedback_chars=resolve_feedback_chars(run_dir),
         )
 
     @classmethod
@@ -4910,6 +4995,7 @@ class OptimizerContext:
             bench_repo=(str(spec.get("bench_repo") or "") or None),
             target_reader=_tp.reader_block(profile),
             memory_skill=str(spec.get("memory_skill") or "md-files"),
+            feedback_chars=int(spec.get("feedback_chars", _DEFAULT_FEEDBACK_CHARS) or 0),
         )
 
     # ---- reusable prompt blocks ----------------------------------------------
@@ -5025,7 +5111,8 @@ class OptimizerContext:
             current_val, focus_ids, label, capabilities=list(self.capabilities),
             algorithm=algorithm, instructions_file=self.instructions_file,
             bench_repo=self.bench_repo, optimizer_name=self.optimizer_name,
-            seed_empty=seed_empty, target_reader=self.target_reader)
+            seed_empty=seed_empty, target_reader=self.target_reader,
+            feedback_chars=self.feedback_chars)
         return (text.rstrip() + "\n\n" + extra.strip() + "\n") if extra.strip() else text
 
 
@@ -5063,6 +5150,24 @@ def _convergence_observations(steps) -> list:
             id=s.get("candidate_id", ""), reward=float(cv.get("reward") or 0.0),
             accepted=bool(s.get("accepted")), stderr=float(cv.get("stderr") or 0.0)))
     return out
+
+
+def _ensure_feedback_split(adapter, run_dir: RunDir, tag: str, split: str, *,
+                           n_trials: int) -> SplitResult:
+    """The parent's results on the proposer's ``split`` (``feedback_split``), evaluating
+    them only when its rollouts on disk do not already cover the whole split.
+
+    The seed's train rollouts exist from baseline (``_baseline_train``), and finalize
+    reuses a best candidate's train rollouts under the same tag, so in practice this
+    costs one train evaluation per newly accepted candidate."""
+    ids = set(run_dir.read_splits().ids(split))
+    have = split_result_from_rollouts(run_dir, tag, split)
+    if have.per_task and ids <= {pt.get("task_id") for pt in have.per_task if has_valid_trials(pt)}:
+        return have
+    cand_dir = run_dir.candidate_dir(tag)
+    run_dir.log_event("feedback_split_eval", tag=tag, split=split, n_tasks=len(ids))
+    evaluate_candidate(adapter, cand_dir, run_dir=run_dir, split=split, n_trials=n_trials, tag=tag)
+    return split_result_from_rollouts(run_dir, tag, split)
 
 
 def hill_climb_loop(
@@ -5109,6 +5214,9 @@ def hill_climb_loop(
     """
     gate_kwargs = dict(gate_kwargs or {})
     rejected, history, store = _init_memory_store(run_dir, store)
+    feedback_split = resolve_feedback_split(run_dir)
+    if feedback_split != "val":
+        run_dir.log_event("feedback_split", split=feedback_split, gate_split="val")
 
     # The shared optimizer read-context (see ``OptimizerContext``). Callers that pass the
     # individual pieces instead of a ``ctx`` get one assembled from them, so hill-climb,
@@ -5161,7 +5269,14 @@ def hill_climb_loop(
         else:
             focus_ids, label = None, focus
         parent_dir = run_dir.candidate_dir(run_dir.best_id)
-        instructions = ctx.instructions(current_val, focus_ids, label,
+        shown = current_val
+        if feedback_split != "val":
+            # The proposer reads the parent's TRAIN results; the gate below still uses
+            # ``current_val``. A narrow focus is over val ids, so it falls back to "all".
+            shown = _ensure_feedback_split(adapter, run_dir, run_dir.best_id or "seed",
+                                           feedback_split, n_trials=n_trials)
+            focus_ids, label = None, f"every failing task on the {feedback_split} split"
+        instructions = ctx.instructions(shown, focus_ids, label,
                                         algorithm=algorithm, parent_dir=parent_dir)
         if convergence:
             # Pure: recomputed from the steps so far, so a resumed run rebuilding the
@@ -5182,7 +5297,7 @@ def hill_climb_loop(
             optimizer=optimizer, instructions=instructions, current_val=current_val,
             n_trials=n_trials, gate_kwargs=gate_kwargs, no_regression=no_regression,
             rejected=rejected, history=history, store=store, ctx=ctx,
-            protected_patterns=protected_patterns,
+            protected_patterns=protected_patterns, eval_split=feedback_split,
         )
         steps.append(step)
         if step.get("budget_unfunded"):

@@ -54,16 +54,25 @@ def test_fmt_falls_back_to_last_feedback_and_caps_each_trial():
     capped = harness._fmt({"task_id": "a", "reward": 0.0, "feedback": long}, max_chars=50)
     assert "x" * 50 + " …[truncated]" in capped and "x" * 51 not in capped
     assert "x" * 1000 in harness._fmt({"task_id": "a", "reward": 0.0, "feedback": long}, max_chars=0)
+    assert "x" * 1000 in harness._fmt({"task_id": "a", "reward": 0.0, "feedback": long})  # default
+
+
+def test_failure_index_lists_every_failing_task():
+    from cap_evolve import harness
+    fails = [{"task_id": f"t{i}", "reward": 0.0, "feedback": f"f{i}"} for i in range(25)]
+    block = harness._failures_block(fails, [], [])
+    assert all(f"- t{i} " in block for i in range(25))
 
 
 def test_feedback_chars_and_split_resolve_from_env(monkeypatch):
     from cap_evolve import harness
-    assert harness.resolve_feedback_chars() == 400
-    assert harness.resolve_feedback_split() == "val"
-    monkeypatch.setenv("CAPEVOLVE_FEEDBACK_CHARS", "0")
-    monkeypatch.setenv("CAPEVOLVE_FEEDBACK_SPLIT", "train")
-    assert harness.resolve_feedback_chars() == 0
-    assert harness.resolve_feedback_split() == "train"
+    assert harness.resolve_feedback_chars() == 0          # default: no cap
+    assert harness.resolve_feedback_split() == "train"    # default: val held out
+    monkeypatch.setenv("CAPEVOLVE_FEEDBACK_CHARS", "1500")
+    assert harness.resolve_feedback_chars() == 1500
+    for v in ("val", "both", "train"):
+        monkeypatch.setenv("CAPEVOLVE_FEEDBACK_SPLIT", v)
+        assert harness.resolve_feedback_split() == v
     monkeypatch.setenv("CAPEVOLVE_FEEDBACK_SPLIT", "test")
     with pytest.raises(ValueError):
         harness.resolve_feedback_split()
@@ -94,11 +103,12 @@ def test_evaluate_records_every_trials_feedback(tmp_path):
     assert got[pt["task_id"]] == pt["raw"]["trial_feedback"]
 
 
-def test_feedback_split_train_shows_train_and_gates_on_val(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["train", "both", "val"])
+def test_feedback_split_shows_its_splits_and_gates_on_val(tmp_path, monkeypatch, mode):
     if shutil.which("git") is None:
         pytest.skip("git not available")
     from cap_evolve import Budget, RunDir, harness
-    monkeypatch.setenv("CAPEVOLVE_FEEDBACK_SPLIT", "train")
+    monkeypatch.setenv("CAPEVOLVE_FEEDBACK_SPLIT", mode)
     adapter = _toy_adapter()
     seed = tmp_path / "seed"
     shutil.copytree(EXAMPLE / "capability", seed)
@@ -113,8 +123,16 @@ def test_feedback_split_train_shows_train_and_gates_on_val(tmp_path, monkeypatch
                             algorithm="hill-climb", capabilities=["system-prompt"])
     work = run_dir.root / "work" / "cand_0001"
     shown = {p.name.split("__")[0] for p in (work / "trajectories").iterdir()}
-    assert shown and shown <= set(splits.train) and not shown & set(splits.val)
-    assert "Current train reward" in (work / "INSTRUCTIONS.md").read_text(encoding="utf-8")
+    instr = (work / "INSTRUCTIONS.md").read_text(encoding="utf-8")
+    tr, va = set(splits.train), set(splits.val)
+    if mode == "train":
+        assert shown and shown <= tr and not shown & va
+    elif mode == "val":
+        assert shown and shown <= va and not shown & tr
+    else:
+        assert shown & tr and shown & va
+    assert ("Current train reward" in instr) == (mode != "val")
+    assert ("Current val reward" in instr) == (mode != "train")
     evals = [json.loads(l) for l in run_dir.events_path.read_text().splitlines() if l.strip()]
     assert any(e.get("kind") == "evaluate" and e.get("split") == "val" and e.get("tag") == "cand_0001"
                for e in evals)

@@ -106,8 +106,9 @@ def test_cyclic_variant_also_improves(tmp_path):
     assert summary["best_val"] == 1.0
 
 
+@pytest.mark.parametrize("fsplit", ["val", "train"])
 @pytest.mark.parametrize("focus", ["cyclic", "hardest-first"])
-def test_narrow_focus_renders_the_focused_tasks_failures(tmp_path, focus):
+def test_narrow_focus_renders_the_focused_tasks_failures(tmp_path, monkeypatch, focus, fsplit):
     """A narrow focus must focus a task the loop actually HAS per-task data for.
 
     ``_focus_instructions`` filters the parent's VAL rows, so a focus set built from
@@ -117,6 +118,8 @@ def test_narrow_focus_renders_the_focused_tasks_failures(tmp_path, focus):
     fixed edit script and never reads the prompt, so only this can see the regression.
     """
     from cap_evolve import Budget, RunDir, harness
+    # The focus walks the split the proposer reads (feedback_split): val, or train.
+    monkeypatch.setenv("CAPEVOLVE_FEEDBACK_SPLIT", fsplit)
     import importlib.util
     spec = importlib.util.spec_from_file_location("toy_calc_adapter", EXAMPLE / "adapter.py")
     toy = importlib.util.module_from_spec(spec)
@@ -138,9 +141,9 @@ def test_narrow_focus_renders_the_focused_tasks_failures(tmp_path, focus):
                             focus=focus, max_iterations=1)
     assert len(seen) == 1
     prompt = seen[0]
-    val_ids = run_dir.read_splits().val
-    assert any(f"Focus: task {t}." in prompt for t in val_ids), \
-        "the focused task must be a VAL id — that is the only per-task data the loop holds"
+    ids = getattr(run_dir.read_splits(), fsplit)
+    assert any(f"Focus: task {t}." in prompt for t in ids), \
+        f"the focused task must be a {fsplit.upper()} id — the split the proposer is shown"
     assert "## (a)" in prompt, "the focused task's failures must reach the optimizer"
     assert "0 failing of 0 tasks" not in prompt
 

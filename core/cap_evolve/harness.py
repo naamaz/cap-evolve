@@ -375,33 +375,36 @@ def resolve_errored_policy(explicit=None, run_dir=None) -> str:
 
 
 FEEDBACK_SPLIT_ENV = "CAPEVOLVE_FEEDBACK_SPLIT"
-FEEDBACK_SPLITS = ("val", "train")
+FEEDBACK_SPLITS = ("train", "val", "both")
+_DEFAULT_FEEDBACK_SPLIT = "train"
 FEEDBACK_CHARS_ENV = "CAPEVOLVE_FEEDBACK_CHARS"
-_DEFAULT_FEEDBACK_CHARS = 400
+_DEFAULT_FEEDBACK_CHARS = 0
 
 
 def resolve_feedback_split(run_dir=None) -> str:
-    """Which split the PROPOSER reads: env ``CAPEVOLVE_FEEDBACK_SPLIT`` > spec
-    ``feedback_split`` > ``val``.
+    """Which split(s) the PROPOSER reads: env ``CAPEVOLVE_FEEDBACK_SPLIT`` > spec
+    ``feedback_split`` > ``train``. The gate always scores on val.
 
-    ``val`` (default) is today's behaviour: the optimizer reads the parent's val traces and
-    the gate scores on val, so the gate set is also the set it tunes against. ``train``
-    shows the optimizer the parent's TRAIN traces and per-task rewards instead; the gate
-    still scores on val only, so val stops being something the proposer has seen. The
-    parent's train rollouts are evaluated once per new best (``_ensure_feedback_split``)."""
+    ``train`` (default): the optimizer reads the parent's TRAIN traces and per-task rewards,
+    so val — the gate set — is held out from the proposer. The parent's train rollouts are
+    evaluated once per new best when not on disk (``_ensure_feedback_split``).
+    ``val``: the pre-2026-11 behaviour — the optimizer reads the parent's val traces, the same
+    tasks the gate scores, so it can tune to the gate set.
+    ``both``: train AND val traces (val as in ``val``, plus the train evaluation)."""
     v = os.environ.get(FEEDBACK_SPLIT_ENV)
     if not v and run_dir is not None:
         from .specfile import spec_for_run
         v = (spec_for_run(run_dir) or {}).get("feedback_split")
-    v = str(v or "val").strip().lower()
+    v = str(v or _DEFAULT_FEEDBACK_SPLIT).strip().lower()
     if v not in FEEDBACK_SPLITS:
         raise ValueError(f"feedback_split must be one of {FEEDBACK_SPLITS}, got {v!r}")
     return v
 
 
 def resolve_feedback_chars(run_dir=None) -> int:
-    """Per-task feedback characters in the prompt's failure index: env
-    ``CAPEVOLVE_FEEDBACK_CHARS`` > spec ``feedback_chars`` > 400. ``0`` = no cap."""
+    """Per-trial feedback characters in the prompt's failure index: env
+    ``CAPEVOLVE_FEEDBACK_CHARS`` > spec ``feedback_chars`` > 0. ``0`` = no cap (default):
+    every listed trial's feedback is shown in full."""
     v = os.environ.get(FEEDBACK_CHARS_ENV)
     if not v and run_dir is not None:
         from .specfile import spec_for_run
@@ -2719,10 +2722,10 @@ def _build_runmap(workdir: Path, run_dir: RunDir) -> None:
         "- `PROCESS.md` — what that iteration did (ranked issues, changes, verify-the-fix, process)\n"
         "- `diff.patch` — the EXACT capability edit it made vs its parent\n\n"
         + (f"The live run dir (read-only) is at `{run_dir.root}` if you need "
-           "`rollouts/<split>/` traces or the git log.\n\n"
-           if resolve_feedback_split(run_dir) == "val" else
+           "`rollouts/<split>/` traces (never `rollouts/test/`) or the git log.\n\n"
+           if resolve_feedback_split(run_dir) != "train" else
            f"The live run dir (read-only) is at `{run_dir.root}` for the git log and "
-           f"`rollouts/{resolve_feedback_split(run_dir)}/` traces only. Do NOT read "
+           "`rollouts/train/` traces only. Do NOT read "
            "`rollouts/val/` or `rollouts/test/`: val is the held-out gate set for this run, "
            "and tuning to it is what the gate exists to catch.\n\n")
         + "\n".join(table) + "\n\n"
@@ -3075,12 +3078,16 @@ def _copy_step_trajectories(adapter, run_dir: RunDir, workdir: Path, split: str,
     the native dir generally cannot be scoped to one candidate.
     """
     dst = workdir / "trajectories"
+    # ``both`` (feedback_split): the parent's train AND val rollouts in one dir. The file
+    # names carry the task id, and the prompt lists which ids are on which split.
+    splits_to_copy = ("train", "val") if split == "both" else (split,)
 
     def _copy_tag(tag: str) -> bool:
-        vdir = run_dir.rollout_dir(split)
-        if not vdir.is_dir():
-            return False
-        files = sorted(vdir.glob(f"*__{tag}__t*.json"))
+        files = []
+        for sp in splits_to_copy:
+            vdir = run_dir.rollout_dir(sp)
+            if vdir.is_dir():
+                files += sorted(vdir.glob(f"*__{tag}__t*.json"))
         if not files:
             return False
         try:
@@ -3112,13 +3119,14 @@ def _copy_step_trajectories(adapter, run_dir: RunDir, workdir: Path, split: str,
 
     # Fallbacks: adapter native dir, then the whole rollouts/<split>/ — so there is
     # ALWAYS something for the optimizer to read.
+    fb_split = splits_to_copy[0]
     traj_src = None
     try:
-        traj_src = adapter.trajectories(split)
+        traj_src = adapter.trajectories(fb_split)
     except Exception:  # noqa: BLE001 — never let optional context break a step
         traj_src = None
     if not traj_src:
-        traj_src = run_dir.rollout_dir(split)
+        traj_src = run_dir.rollout_dir(fb_split)
     try:
         traj_src = Path(traj_src)
         if traj_src.is_dir() and any(traj_src.iterdir()):
@@ -4288,7 +4296,7 @@ def _failures_block(always_fail, flaky, errored, *, max_chars: int = _DEFAULT_FE
     if always_fail:
         lines.append(f"## (a) {len(always_fail)} ALWAYS-failing task(s) — fix the shared "
                      f"root cause ({where}):")
-        lines += [_fmt(pt, max_chars) for pt in always_fail[:10]]
+        lines += [_fmt(pt, max_chars) for pt in always_fail]
         lines.append("")
     if flaky:
         lines.append(f"## (b) {len(flaky)} FLAKY task(s) — pass sometimes; make the good "
@@ -4297,7 +4305,7 @@ def _failures_block(always_fail, flaky, errored, *, max_chars: int = _DEFAULT_FE
                      "is listed with its own reward.)" if multi else
                      "(reward is the mean over trials — the honest signal; the feedback line is "
                      "from the LAST trial and may say 'passed' even when the mean is below 1.)")
-        lines += [_fmt(pt, max_chars) for pt in flaky[:8]]
+        lines += [_fmt(pt, max_chars) for pt in flaky]
         lines.append("")
     if not always_fail and not flaky:
         lines.append("## No actionable failures in focus — seek a robustness/generalization gain "
@@ -5152,6 +5160,20 @@ def _convergence_observations(steps) -> list:
     return out
 
 
+def val_feedback_block(current_val: SplitResult, focus_ids, label: str, *,
+                       max_chars: int = _DEFAULT_FEEDBACK_CHARS) -> str:
+    """The val summary + failure index alone, for ``feedback_split: both`` (appended after
+    the train-rendered prompt so the template's framing is not repeated)."""
+    per = ([pt for pt in current_val.per_task if pt.get("task_id") in set(focus_ids)]
+           if focus_ids is not None else current_val.per_task)
+    errored, always_fail, flaky, solid = _classify(per)
+    head = (f"Focus: {label}. Current val reward {current_val.reward:.3f}: "
+            f"{len(solid)} solid / {len(flaky)} flaky / {len(always_fail)} failing"
+            + (f" / {len(errored)} infra-errored" if errored else "") + f" of {len(per)} tasks.")
+    return head + "\n\n" + _failures_block(always_fail, flaky, errored, max_chars=max_chars,
+                                           split="val")
+
+
 def _ensure_feedback_split(adapter, run_dir: RunDir, tag: str, split: str, *,
                            n_trials: int) -> SplitResult:
     """The parent's results on the proposer's ``split`` (``feedback_split``), evaluating
@@ -5215,6 +5237,17 @@ def hill_climb_loop(
     gate_kwargs = dict(gate_kwargs or {})
     rejected, history, store = _init_memory_store(run_dir, store)
     feedback_split = resolve_feedback_split(run_dir)
+    if feedback_split != "val" and run_dir.read_splits().pooled:
+        # Pooled mode (split_mode: pooled) re-partitions train+val into its own proposer
+        # stratum F and hidden confirm stratum C; train ids may be in C, so evaluating and
+        # showing "train" would leak C. That mode already holds its gate set out.
+        run_dir.log_event("feedback_split", split="val", requested=feedback_split,
+                          reason="split_mode pooled: the proposer split is the feedback stratum")
+        feedback_split = "val"
+    elif not run_dir.read_splits().train and feedback_split != "val":
+        run_dir.log_event("feedback_split", split="val", requested=feedback_split,
+                          reason="no train ids in the frozen split")
+        feedback_split = "val"
     if feedback_split != "val":
         run_dir.log_event("feedback_split", split=feedback_split, gate_split="val")
 
@@ -5237,8 +5270,11 @@ def hill_climb_loop(
     # focus set of TRAIN ids intersects those rows in nothing at all and the optimizer
     # prompt renders zero failures. ``current_val`` already holds every focused task's
     # reward, so hardest-first orders straight off it — no extra evaluation to buy.
-    order = list(run_dir.read_splits().val)
-    if focus == "hardest-first":
+    # With ``feedback_split`` train/both the focus walks the TRAIN ids instead (the rows the
+    # train-rendered prompt filters), ordered by the parent's train rewards each iteration.
+    focus_split = "val" if feedback_split == "val" else "train"
+    order = list(run_dir.read_splits().val if focus_split == "val" else run_dir.read_splits().train)
+    if focus == "hardest-first" and focus_split == "val":
         score_by = {pt.get("task_id"): float(pt.get("reward", 0.0) or 0.0)
                     for pt in current_val.per_task}
         order.sort(key=lambda t: score_by.get(t, 0.0))  # hardest (lowest) first
@@ -5261,23 +5297,31 @@ def hill_climb_loop(
         exhausted, why = run_dir.budget_exhausted()
         if exhausted:
             break
+        parent_dir = run_dir.candidate_dir(run_dir.best_id)
+        # What the proposer is shown: the parent's val result (the gate's own), or — with
+        # feedback_split train/both — its TRAIN result; the gate below always uses current_val.
+        shown = (current_val if focus_split == "val" else
+                 _ensure_feedback_split(adapter, run_dir, run_dir.best_id or "seed", "train",
+                                        n_trials=n_trials))
+        if focus == "hardest-first" and focus_split != "val" and i == 0:
+            # Ordered ONCE, off the loop-entry parent — as the val path orders off current_val.
+            score_by = {pt.get("task_id"): float(pt.get("reward", 0.0) or 0.0)
+                        for pt in shown.per_task}
+            order.sort(key=lambda t: score_by.get(t, 0.0))
         if focus == "all":
-            focus_ids, label = None, "every failing task on the val split"
+            focus_ids, label = None, f"every failing task on the {focus_split} split"
         elif focus in ("cyclic", "hardest-first"):
             focus_ids = [order[i % len(order)]] if order else None
-            label = f"task {focus_ids[0]}" if focus_ids else "the whole val split"
+            label = f"task {focus_ids[0]}" if focus_ids else f"the whole {focus_split} split"
         else:
             focus_ids, label = None, focus
-        parent_dir = run_dir.candidate_dir(run_dir.best_id)
-        shown = current_val
-        if feedback_split != "val":
-            # The proposer reads the parent's TRAIN results; the gate below still uses
-            # ``current_val``. A narrow focus is over val ids, so it falls back to "all".
-            shown = _ensure_feedback_split(adapter, run_dir, run_dir.best_id or "seed",
-                                           feedback_split, n_trials=n_trials)
-            focus_ids, label = None, f"every failing task on the {feedback_split} split"
         instructions = ctx.instructions(shown, focus_ids, label,
                                         algorithm=algorithm, parent_dir=parent_dir)
+        if feedback_split == "both":
+            instructions = (instructions.rstrip() + "\n\n# The parent's VAL results "
+                            "(the gate set) — also in ./trajectories/\n\n"
+                            + val_feedback_block(current_val, None, "every failing task on the val split",
+                                                 max_chars=ctx.feedback_chars))
         if convergence:
             # Pure: recomputed from the steps so far, so a resumed run rebuilding the
             # same observation list gets the identical signal.
